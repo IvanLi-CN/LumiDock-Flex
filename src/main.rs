@@ -20,7 +20,11 @@ use embassy_stm32::{
     peripherals::{self, DMA1_CH3, DMA1_CH4, I2C1, PB0, PC14},
     spi::{self, Spi},
     time::{khz, Hertz},
-    timer::simple_pwm::{PwmPin, SimplePwm},
+    timer::{
+        pwm_input::PwmInput,
+        simple_pwm::{PwmPin, SimplePwm},
+    },
+    Peripheral,
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 
@@ -33,7 +37,7 @@ use panic_probe as _;
 use gx21m15::Gx21m15;
 use sgm41511::{types::Reg06Values, SGM41511};
 use shared::{
-    AVAILABLE_VOLT_CURR_MUTEX, BTN_A_STATE_CHANNEL, BTN_B_STATE_CHANNEL, DISPLAY, PDO_PUBSUB,
+    AVAILABLE_VOLT_CURR_MUTEX, BTN_A_STATE_CHANNEL, BTN_B_STATE_CHANNEL, BTN_C_STATE_CHANNEL, BTN_D_STATE_CHANNEL, DISPLAY, PDO_PUBSUB
 };
 use st7789::{self, ST7789};
 use static_cell::StaticCell;
@@ -61,25 +65,6 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
     defmt::println!("Hello, LumiDock Flex!");
-
-    let led_a_pin = PwmPin::new_ch1(p.PA8, OutputType::PushPull);
-    let led_b_pin = PwmPin::new_ch2(p.PB3, OutputType::PushPull);
-    let blk_pin = PwmPin::new_ch3(p.PB6, OutputType::PushPull);
-
-    let mut tim1 = SimplePwm::new(
-        p.TIM1,
-        Some(led_a_pin),
-        Some(led_b_pin),
-        Some(blk_pin),
-        None,
-        khz(1),
-        embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
-    );
-
-    tim1.enable(embassy_stm32::timer::Channel::Ch1);
-    tim1.enable(embassy_stm32::timer::Channel::Ch2);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch1, tim1.get_max_duty() / 3);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch2, tim1.get_max_duty() / 3);
 
     let mut os_pin = ExtiInput::new(p.PB1, p.EXTI1, Pull::Up);
 
@@ -179,29 +164,81 @@ async fn main(spawner: Spawner) {
     husb238.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
     husb238.go_command(Command::Request).await.unwrap();
 
+    let led_a_pin = PwmPin::new_ch1(p.PA8, OutputType::PushPull);
+    let led_b_pin = PwmPin::new_ch2(p.PB3, OutputType::PushPull);
+    let blk_pin = PwmPin::new_ch3(p.PB6, OutputType::PushPull);
+
+    let mut tim1 = SimplePwm::new(
+        p.TIM1,
+        Some(led_a_pin),
+        Some(led_b_pin),
+        Some(blk_pin),
+        None,
+        khz(50),
+        embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
+    );
+
+    tim1.enable(embassy_stm32::timer::Channel::Ch1);
+    tim1.enable(embassy_stm32::timer::Channel::Ch2);
+    tim1.set_duty(embassy_stm32::timer::Channel::Ch1, tim1.get_max_duty() / 10);
+    tim1.set_duty(embassy_stm32::timer::Channel::Ch2, tim1.get_max_duty() / 10);
+
+    // Fan
+
+    let mut fan_speed_pin = PwmInput::new(
+        unsafe { p.TIM2.clone_unchecked() },
+        p.PA15,
+        Pull::Up,
+        khz(1000),
+    );
+    // let fan_ctrl_pin = PwmPin::new_ch3(p.PA2, OutputType::PushPull);
+
+    // let mut tim2 = SimplePwm::new(
+    //     p.TIM2,
+    //     None,
+    //     None,
+    //     Some(fan_ctrl_pin),
+    //     None,
+    //     Hertz(100),
+    //     embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
+    // );
+    // tim2.enable(embassy_stm32::timer::Channel::Ch3);
+
+    // tim2.set_duty(embassy_stm32::timer::Channel::Ch3, tim2.get_max_duty() / 10);
+    fan_speed_pin.enable();
+
     // init buttons
 
-    let button_a = ExtiInput::new(p.PB5, p.EXTI5, Pull::Up);
-    let button_b = ExtiInput::new(p.PB4, p.EXTI4, Pull::Up);
+    let button_a = ExtiInput::new(p.PC15, p.EXTI15, Pull::Up);
+    let button_b = ExtiInput::new(p.PB14, p.EXTI14, Pull::Up);
+    let button_c = ExtiInput::new(p.PB4, p.EXTI4, Pull::Up);
+    let button_d = ExtiInput::new(p.PB5, p.EXTI5, Pull::Up);
 
     // spawner.spawn(controller_exec()).ok();
-    // spawner.spawn(btns_exec(button_a, button_b)).ok();
+    spawner
+        .spawn(btns_exec(button_a, button_b, button_c, button_d))
+        .ok();
 
     let mut ch_a_duty: i64 = 0;
     let mut ch_a_step = 20;
 
     loop {
-        let max = tim1.get_max_duty() as i64;
+        let max = (tim1.get_max_duty() / 10) as i64;
         ch_a_duty += ch_a_step;
         if ch_a_duty > max {
-            ch_a_step = -20;
+            ch_a_step = -1;
             ch_a_duty = max;
         } else if ch_a_duty < 0 {
-            ch_a_step = 20;
+            ch_a_step = 1;
             ch_a_duty = 0;
         }
 
-        defmt::info!("duty/max: {}/{}", ch_a_duty, max);
+        defmt::info!(
+            "fan speed: {},\tduty/max: {}/{}.",
+            1000_000i64.checked_div(fan_speed_pin.get_period_ticks() as i64),
+            ch_a_duty,
+            max,
+        );
 
         tim1.set_duty(
             embassy_stm32::timer::Channel::Ch1,
@@ -211,19 +248,30 @@ async fn main(spawner: Spawner) {
             embassy_stm32::timer::Channel::Ch2,
             (max - ch_a_duty).try_into().unwrap_or_default(),
         );
-        Timer::after(Duration::from_millis(33)).await;
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
 #[embassy_executor::task]
-async fn btns_exec(mut btn_a: ExtiInput<'static>, mut btn_b: ExtiInput<'static>) {
+async fn btns_exec(
+    mut btn_a: ExtiInput<'static>,
+    mut btn_b: ExtiInput<'static>,
+    mut btn_c: ExtiInput<'static>,
+    mut btn_d: ExtiInput<'static>,
+) {
     let mut button_a = Button::new(&BTN_A_STATE_CHANNEL);
     let mut button_b = Button::new(&BTN_B_STATE_CHANNEL);
+    let mut button_c = Button::new(&BTN_C_STATE_CHANNEL);
+    let mut button_d = Button::new(&BTN_D_STATE_CHANNEL);
 
     loop {
         let btn_a_change = btn_a.wait_for_any_edge();
 
         let btn_b_change = btn_b.wait_for_any_edge();
+
+        let btn_c_change = btn_c.wait_for_any_edge();
+
+        let btn_d_change = btn_d.wait_for_any_edge();
 
         let mut ticker = Ticker::every(Duration::from_millis(100));
 

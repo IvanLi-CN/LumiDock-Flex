@@ -42,6 +42,10 @@ pub(crate) static BTN_A_STATE_CHANNEL: Channel<CriticalSectionRawMutex, ButtonSt
     Channel::new();
 pub(crate) static BTN_B_STATE_CHANNEL: Channel<CriticalSectionRawMutex, ButtonState, 10> =
     Channel::new();
+pub(crate) static BTN_C_STATE_CHANNEL: Channel<CriticalSectionRawMutex, ButtonState, 10> =
+    Channel::new();
+pub(crate) static BTN_D_STATE_CHANNEL: Channel<CriticalSectionRawMutex, ButtonState, 10> =
+    Channel::new();
 
 pub(crate) static PAGE_PUBSUB: PubSubChannel<CriticalSectionRawMutex, Page, 2, 2, 1> =
     PubSubChannel::new();
