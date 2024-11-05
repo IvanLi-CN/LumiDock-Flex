@@ -10,7 +10,7 @@ use embassy_embedded_hal::shared_bus::{
     I2cDeviceError,
 };
 use embassy_executor::Spawner;
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_stm32::{
     bind_interrupts,
     exti::ExtiInput,
@@ -30,6 +30,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 
 use defmt_rtt as _;
 use embassy_time::{Duration, Ticker, Timer};
+use embedded_graphics::{pixelcolor::Rgb565, prelude::RgbColor};
 use husb238::{Command, Husb238};
 // global logger
 use panic_probe as _;
@@ -37,7 +38,8 @@ use panic_probe as _;
 use gx21m15::Gx21m15;
 use sgm41511::{types::Reg06Values, SGM41511};
 use shared::{
-    AVAILABLE_VOLT_CURR_MUTEX, BTN_A_STATE_CHANNEL, BTN_B_STATE_CHANNEL, BTN_C_STATE_CHANNEL, BTN_D_STATE_CHANNEL, DISPLAY, PDO_PUBSUB
+    AVAILABLE_VOLT_CURR_MUTEX, BTN_A_STATE_CHANNEL, BTN_B_STATE_CHANNEL, BTN_C_STATE_CHANNEL,
+    BTN_D_STATE_CHANNEL, DISPLAY, PDO_PUBSUB,
 };
 use st7789::{self, ST7789};
 use static_cell::StaticCell;
@@ -66,32 +68,29 @@ async fn main(spawner: Spawner) {
 
     defmt::println!("Hello, LumiDock Flex!");
 
-    let mut os_pin = ExtiInput::new(p.PB1, p.EXTI1, Pull::Up);
+    let mut os_pin = ExtiInput::new(p.PA1, p.EXTI1, Pull::Up);
 
-    // let mut config = spi::Config::default();
-    // config.frequency = Hertz(16_000_000);
-    // let spi = Spi::new_txonly(p.SPI1, p.PA5, p.PA7, p.DMA1_CH1, p.DMA1_CH2, config); // SCK is unused.
-    // let spi: Mutex<CriticalSectionRawMutex, _> = Mutex::new(spi);
-    // let spi = SPI_BUS_MUTEX.init(spi);
+    let mut config = spi::Config::default();
+    config.frequency = Hertz(8_000_000);
+    let spi: Spi<'_, Async> = Spi::new_txonly(p.SPI1, p.PA5, p.PA7, p.DMA1_CH1, config); // SCK is unused.
+    let spi: Mutex<CriticalSectionRawMutex, _> = Mutex::new(spi);
+    let spi = SPI_BUS_MUTEX.init(spi);
 
-    // // init display
+    // init display
 
     // let cs_pin = Output::new(p.PA4, Level::High, Speed::High);
-    // let dc_pin = Output::new(p.PA15, Level::Low, Speed::High);
+    // let dc_pin = Output::new(p.PA6, Level::Low, Speed::High);
     // let rst_pin = Output::new(p.PA12, Level::Low, Speed::High);
-
-    // // let cs_pin = ST7789_CS_PIN.init(cs_pin);
-    // // let dc_pin = ST7789_DC_PIN.init(dc_pin);
-    // // let rst_pin = ST7789_RST_PIN.init(rst_pin);
 
     // let spi_dev = SpiDevice::new(spi, cs_pin);
 
-    // // let spi_dev = ST7789_SPI_DEV.init(spi_dev);
+    // let mut st7789: ST7789Display =
+    //     ST7789::new(st7789::Config::default(), spi_dev, dc_pin, rst_pin);
+    // // let mut _display = Display::new(st7789);
 
-    // let st7789: ST7789Display = ST7789::new(st7789::Config::default(), spi_dev, dc_pin, rst_pin);
-    // let mut _display = Display::new(st7789);
-
-    // _display.init().await.unwrap();
+    // // _display.init().await.unwrap();
+    // st7789.init().await.unwrap();
+    // st7789.fill_color(Rgb565::BLUE).await.unwrap();
 
     // let mut display = DISPLAY.lock().await;
     // *display = Some(_display);
@@ -174,14 +173,16 @@ async fn main(spawner: Spawner) {
         Some(led_b_pin),
         Some(blk_pin),
         None,
-        khz(50),
+        khz(1),
         embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
     );
 
     tim1.enable(embassy_stm32::timer::Channel::Ch1);
     tim1.enable(embassy_stm32::timer::Channel::Ch2);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch1, tim1.get_max_duty() / 10);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch2, tim1.get_max_duty() / 10);
+    tim1.enable(embassy_stm32::timer::Channel::Ch3);
+    tim1.set_duty(embassy_stm32::timer::Channel::Ch1, tim1.get_max_duty());
+    tim1.set_duty(embassy_stm32::timer::Channel::Ch2, tim1.get_max_duty());
+    tim1.set_duty(embassy_stm32::timer::Channel::Ch3, tim1.get_max_duty() / 50);
 
     // Fan
 
@@ -191,20 +192,20 @@ async fn main(spawner: Spawner) {
         Pull::Up,
         khz(1000),
     );
-    // let fan_ctrl_pin = PwmPin::new_ch3(p.PA2, OutputType::PushPull);
+    let fan_ctrl_pin = PwmPin::new_ch1(p.PB1, OutputType::PushPull);
 
-    // let mut tim2 = SimplePwm::new(
-    //     p.TIM2,
-    //     None,
-    //     None,
-    //     Some(fan_ctrl_pin),
-    //     None,
-    //     Hertz(100),
-    //     embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
-    // );
-    // tim2.enable(embassy_stm32::timer::Channel::Ch3);
+    let mut tim14 = SimplePwm::new(
+        p.TIM14,
+        Some(fan_ctrl_pin),
+        None,
+        None,
+        None,
+        Hertz(200000),
+        embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
+    );
+    tim14.enable(embassy_stm32::timer::Channel::Ch1);
 
-    // tim2.set_duty(embassy_stm32::timer::Channel::Ch3, tim2.get_max_duty() / 10);
+    tim14.set_duty(embassy_stm32::timer::Channel::Ch1, tim14.get_max_duty() * 3 / 5);
     fan_speed_pin.enable();
 
     // init buttons
@@ -221,34 +222,41 @@ async fn main(spawner: Spawner) {
 
     let mut ch_a_duty: i64 = 0;
     let mut ch_a_step = 20;
+    let mut index = 0;
 
     loop {
-        let max = (tim1.get_max_duty() / 10) as i64;
-        ch_a_duty += ch_a_step;
-        if ch_a_duty > max {
-            ch_a_step = -1;
-            ch_a_duty = max;
-        } else if ch_a_duty < 0 {
-            ch_a_step = 1;
-            ch_a_duty = 0;
-        }
+        // index = (index + 1) % 10;
+        // let max_led = (tim1.get_max_duty() / 10) as i64;
+        // let max_fan = (tim14.get_max_duty() / 10) as i64;
+        // ch_a_duty += ch_a_step;
+        // if ch_a_duty > max_led {
+        //     ch_a_step = -1;
+        //     ch_a_duty = max_led;
+        // } else if ch_a_duty < 0 {
+        //     ch_a_step = 1;
+        //     ch_a_duty = 0;
+        // }
 
-        defmt::info!(
-            "fan speed: {},\tduty/max: {}/{}.",
-            1000_000i64.checked_div(fan_speed_pin.get_period_ticks() as i64),
-            ch_a_duty,
-            max,
-        );
+        // defmt::info!(
+        //     "fan speed: {},\tduty/max: {}/{}.",
+        //     1000_000i64.checked_div(fan_speed_pin.get_period_ticks() as i64),
+        //     ch_a_duty,
+        //     max_led,
+        // );
+        defmt::info!("fan speed: {}.", 1000_000i64.checked_div(fan_speed_pin.get_period_ticks() as i64));
 
-        tim1.set_duty(
-            embassy_stm32::timer::Channel::Ch1,
-            ch_a_duty.try_into().unwrap_or_default(),
-        );
-        tim1.set_duty(
-            embassy_stm32::timer::Channel::Ch2,
-            (max - ch_a_duty).try_into().unwrap_or_default(),
-        );
-        Timer::after(Duration::from_millis(100)).await;
+        // tim1.set_duty(
+        //     embassy_stm32::timer::Channel::Ch1,
+        //     ch_a_duty.try_into().unwrap_or_default(),
+        // );
+        // tim1.set_duty(
+        //     embassy_stm32::timer::Channel::Ch2,
+        //     (max_led - ch_a_duty).try_into().unwrap_or_default(),
+        // );
+
+        // st7789.init().await.unwrap();
+        // st7789.fill_color(Rgb565::new(16, index * 5, 16)).await.unwrap();
+        Timer::after(Duration::from_millis(1000)).await;
     }
 }
 
@@ -275,26 +283,50 @@ async fn btns_exec(
 
         let mut ticker = Ticker::every(Duration::from_millis(100));
 
-        let futures = select3(btn_a_change, btn_b_change, ticker.next());
+        let btn_group_a = select(btn_a_change, btn_b_change);
+
+        let btn_group_b = select(btn_c_change, btn_d_change);
+
+        let futures = select3(btn_group_a, btn_group_b, ticker.next());
 
         match futures.await {
-            Either3::First(_) => {
-                if btn_a.is_high() {
-                    button_a.on_release().await;
-                } else {
-                    button_a.on_press().await;
+            Either3::First(group) => match group {
+                Either::First(_) => {
+                    if btn_a.is_high() {
+                        button_a.on_release().await;
+                    } else {
+                        button_a.on_press().await;
+                    }
                 }
-            }
-            Either3::Second(_) => {
-                if btn_b.is_high() {
-                    button_b.on_release().await;
-                } else {
-                    button_b.on_press().await;
+                Either::Second(_) => {
+                    if btn_b.is_high() {
+                        button_b.on_release().await;
+                    } else {
+                        button_b.on_press().await;
+                    }
                 }
-            }
+            },
+            Either3::Second(group) => match group {
+                Either::First(_) => {
+                    if btn_c.is_high() {
+                        button_c.on_release().await;
+                    } else {
+                        button_c.on_press().await;
+                    }
+                }
+                Either::Second(_) => {
+                    if btn_d.is_high() {
+                        button_d.on_release().await;
+                    } else {
+                        button_d.on_press().await;
+                    }
+                }
+            },
             Either3::Third(_) => {
                 button_a.update().await;
                 button_b.update().await;
+                button_c.update().await;
+                button_d.update().await;
             }
         };
     }
