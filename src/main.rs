@@ -1,24 +1,15 @@
 #![no_std]
 #![no_main]
 
-use button::Button;
-use controller::Controller;
-use cortex_m::prelude::_embedded_hal_digital_OutputPin;
-use display::Display;
-use embassy_embedded_hal::shared_bus::{
-    asynch::{i2c::I2cDevice, spi::SpiDevice},
-    I2cDeviceError,
-};
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_stm32::{
     bind_interrupts,
     exti::ExtiInput,
-    gpio::{Input, Level, Output, OutputType, Pull, Speed},
+    gpio::{OutputType, Pull},
     i2c::{self, I2c},
     mode::Async,
-    peripherals::{self, DMA1_CH3, DMA1_CH4, I2C1, PB0, PC14},
-    spi::{self, Spi},
+    peripherals::{self},
     time::{khz, Hertz},
     timer::{
         pwm_input::PwmInput,
@@ -29,28 +20,17 @@ use embassy_stm32::{
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 
 use defmt_rtt as _;
-use embassy_time::{Duration, Ticker, Timer};
-use embedded_graphics::{pixelcolor::Rgb565, prelude::RgbColor};
+use embassy_time::{Duration, Ticker};
 use husb238::{Command, Husb238};
 // global logger
 use panic_probe as _;
 
 use gx21m15::Gx21m15;
 use sgm41511::{types::Reg06Values, SGM41511};
-use shared::{
-    AVAILABLE_VOLT_CURR_MUTEX, BTN_A_STATE_CHANNEL, BTN_B_STATE_CHANNEL, BTN_C_STATE_CHANNEL,
-    BTN_D_STATE_CHANNEL, DISPLAY, PDO_PUBSUB,
-};
-use st7789::{self, ST7789};
+use shared::LED_LEVEL_STEP;
 use static_cell::StaticCell;
-use types::{AvailableVoltCurr, ST7789Display, SpiBus};
 
-mod button;
-mod controller;
-mod display;
-mod font;
 mod shared;
-mod types;
 
 static SPI_BUS_MUTEX: StaticCell<Mutex<CriticalSectionRawMutex, SpiBus>> = StaticCell::new();
 static HUSB238_I2C_MUTEX: StaticCell<Mutex<CriticalSectionRawMutex, I2c<'_, Async>>> =
@@ -69,34 +49,6 @@ async fn main(spawner: Spawner) {
     defmt::println!("Hello, LumiDock Flex!");
 
     let mut os_pin = ExtiInput::new(p.PA1, p.EXTI1, Pull::Up);
-
-    let mut config = spi::Config::default();
-    config.frequency = Hertz(8_000_000);
-    let spi: Spi<'_, Async> = Spi::new_txonly(p.SPI1, p.PA5, p.PA7, p.DMA1_CH1, config); // SCK is unused.
-    let spi: Mutex<CriticalSectionRawMutex, _> = Mutex::new(spi);
-    let spi = SPI_BUS_MUTEX.init(spi);
-
-    // init display
-
-    // let cs_pin = Output::new(p.PA4, Level::High, Speed::High);
-    // let dc_pin = Output::new(p.PA6, Level::Low, Speed::High);
-    // let rst_pin = Output::new(p.PA12, Level::Low, Speed::High);
-
-    // let spi_dev = SpiDevice::new(spi, cs_pin);
-
-    // let mut st7789: ST7789Display =
-    //     ST7789::new(st7789::Config::default(), spi_dev, dc_pin, rst_pin);
-    // // let mut _display = Display::new(st7789);
-
-    // // _display.init().await.unwrap();
-    // st7789.init().await.unwrap();
-    // st7789.fill_color(Rgb565::BLUE).await.unwrap();
-
-    // let mut display = DISPLAY.lock().await;
-    // *display = Some(_display);
-    // drop(display);
-
-    // init backlight
 
     let i2c = I2c::new(
         p.I2C1,
@@ -173,15 +125,15 @@ async fn main(spawner: Spawner) {
         Some(led_b_pin),
         Some(blk_pin),
         None,
-        khz(1),
+        khz(10),
         embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
     );
 
     tim1.enable(embassy_stm32::timer::Channel::Ch1);
     tim1.enable(embassy_stm32::timer::Channel::Ch2);
     tim1.enable(embassy_stm32::timer::Channel::Ch3);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch1, tim1.get_max_duty());
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch2, tim1.get_max_duty());
+    tim1.set_duty(embassy_stm32::timer::Channel::Ch1, tim1.get_max_duty() * 0);
+    tim1.set_duty(embassy_stm32::timer::Channel::Ch2, tim1.get_max_duty() * 0);
     tim1.set_duty(embassy_stm32::timer::Channel::Ch3, tim1.get_max_duty() / 50);
 
     // Fan
@@ -205,136 +157,62 @@ async fn main(spawner: Spawner) {
     );
     tim14.enable(embassy_stm32::timer::Channel::Ch1);
 
-    tim14.set_duty(embassy_stm32::timer::Channel::Ch1, tim14.get_max_duty() * 3 / 5);
+    tim14.set_duty(
+        embassy_stm32::timer::Channel::Ch1,
+        tim14.get_max_duty() * 3 / 5,
+    );
     fan_speed_pin.enable();
 
     // init buttons
 
     let button_a = ExtiInput::new(p.PC15, p.EXTI15, Pull::Up);
-    let button_b = ExtiInput::new(p.PB14, p.EXTI14, Pull::Up);
+    let button_b = ExtiInput::new(p.PC14, p.EXTI14, Pull::Up);
     let button_c = ExtiInput::new(p.PB4, p.EXTI4, Pull::Up);
     let button_d = ExtiInput::new(p.PB5, p.EXTI5, Pull::Up);
 
-    // spawner.spawn(controller_exec()).ok();
-    spawner
-        .spawn(btns_exec(button_a, button_b, button_c, button_d))
-        .ok();
+    let btn_cw_up = button_b;
+    let btn_cw_down = button_a;
+    let btn_ww_up = button_c;
+    let btn_ww_down = button_d;
 
-    let mut ch_a_duty: i64 = 0;
-    let mut ch_a_step = 20;
-    let mut index = 0;
+    let mut btn_cw_level = 0f64;
+    let mut btn_ww_level = 0f64;
 
-    loop {
-        // index = (index + 1) % 10;
-        // let max_led = (tim1.get_max_duty() / 10) as i64;
-        // let max_fan = (tim14.get_max_duty() / 10) as i64;
-        // ch_a_duty += ch_a_step;
-        // if ch_a_duty > max_led {
-        //     ch_a_step = -1;
-        //     ch_a_duty = max_led;
-        // } else if ch_a_duty < 0 {
-        //     ch_a_step = 1;
-        //     ch_a_duty = 0;
-        // }
-
-        // defmt::info!(
-        //     "fan speed: {},\tduty/max: {}/{}.",
-        //     1000_000i64.checked_div(fan_speed_pin.get_period_ticks() as i64),
-        //     ch_a_duty,
-        //     max_led,
-        // );
-        defmt::info!("fan speed: {}.", 1000_000i64.checked_div(fan_speed_pin.get_period_ticks() as i64));
-
-        // tim1.set_duty(
-        //     embassy_stm32::timer::Channel::Ch1,
-        //     ch_a_duty.try_into().unwrap_or_default(),
-        // );
-        // tim1.set_duty(
-        //     embassy_stm32::timer::Channel::Ch2,
-        //     (max_led - ch_a_duty).try_into().unwrap_or_default(),
-        // );
-
-        // st7789.init().await.unwrap();
-        // st7789.fill_color(Rgb565::new(16, index * 5, 16)).await.unwrap();
-        Timer::after(Duration::from_millis(1000)).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn btns_exec(
-    mut btn_a: ExtiInput<'static>,
-    mut btn_b: ExtiInput<'static>,
-    mut btn_c: ExtiInput<'static>,
-    mut btn_d: ExtiInput<'static>,
-) {
-    let mut button_a = Button::new(&BTN_A_STATE_CHANNEL);
-    let mut button_b = Button::new(&BTN_B_STATE_CHANNEL);
-    let mut button_c = Button::new(&BTN_C_STATE_CHANNEL);
-    let mut button_d = Button::new(&BTN_D_STATE_CHANNEL);
+    let mut ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
-        let btn_a_change = btn_a.wait_for_any_edge();
+        if btn_cw_up.is_low() && btn_cw_down.is_high() {
+            btn_cw_level = (LED_LEVEL_STEP + btn_cw_level).min(1.0);
+            tim1.set_duty(
+                embassy_stm32::timer::Channel::Ch1,
+                (tim1.get_max_duty() as f64 * btn_cw_level) as u32,
+            );
+            defmt::info!("CW UP: {}", btn_cw_level);
+        } else if btn_cw_up.is_high() && btn_cw_down.is_low() {
+            btn_cw_level = (btn_cw_level - LED_LEVEL_STEP).max(0.0);
+            tim1.set_duty(
+                embassy_stm32::timer::Channel::Ch1,
+                (tim1.get_max_duty() as f64 * btn_cw_level) as u32,
+            );
+            defmt::info!("CW DOWN: {}", btn_cw_level);
+        }
 
-        let btn_b_change = btn_b.wait_for_any_edge();
-
-        let btn_c_change = btn_c.wait_for_any_edge();
-
-        let btn_d_change = btn_d.wait_for_any_edge();
-
-        let mut ticker = Ticker::every(Duration::from_millis(100));
-
-        let btn_group_a = select(btn_a_change, btn_b_change);
-
-        let btn_group_b = select(btn_c_change, btn_d_change);
-
-        let futures = select3(btn_group_a, btn_group_b, ticker.next());
-
-        match futures.await {
-            Either3::First(group) => match group {
-                Either::First(_) => {
-                    if btn_a.is_high() {
-                        button_a.on_release().await;
-                    } else {
-                        button_a.on_press().await;
-                    }
-                }
-                Either::Second(_) => {
-                    if btn_b.is_high() {
-                        button_b.on_release().await;
-                    } else {
-                        button_b.on_press().await;
-                    }
-                }
-            },
-            Either3::Second(group) => match group {
-                Either::First(_) => {
-                    if btn_c.is_high() {
-                        button_c.on_release().await;
-                    } else {
-                        button_c.on_press().await;
-                    }
-                }
-                Either::Second(_) => {
-                    if btn_d.is_high() {
-                        button_d.on_release().await;
-                    } else {
-                        button_d.on_press().await;
-                    }
-                }
-            },
-            Either3::Third(_) => {
-                button_a.update().await;
-                button_b.update().await;
-                button_c.update().await;
-                button_d.update().await;
-            }
-        };
+        if btn_ww_up.is_low() && btn_ww_down.is_high() {
+            btn_ww_level = (LED_LEVEL_STEP + btn_ww_level).min(1.0);
+            tim1.set_duty(
+                embassy_stm32::timer::Channel::Ch2,
+                (tim1.get_max_duty() as f64 * btn_ww_level) as u32,
+            );
+            defmt::info!("WW UpAndDown: {}", btn_ww_level);
+        } else if btn_ww_up.is_high() && btn_ww_down.is_low() {
+            btn_ww_level = (btn_ww_level - LED_LEVEL_STEP).max(0.0);
+            tim1.set_duty(
+                embassy_stm32::timer::Channel::Ch2,
+                (tim1.get_max_duty() as f64 * btn_ww_level) as u32,
+            );
+            defmt::info!("WW DOWN: {}", btn_ww_level);
+        }
+        
+        ticker.next().await;
     }
-}
-
-#[embassy_executor::task]
-async fn controller_exec() {
-    let mut controller = Controller::new();
-
-    controller.task().await;
 }
