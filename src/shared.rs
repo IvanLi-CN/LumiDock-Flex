@@ -1,2 +1,4 @@
-
 pub const LED_LEVEL_STEP: f64 = 0.01;
+pub const OTP_SHUTDOWN_TEMP: f64 = 60.0;
+pub const OTP_HYSTERESIS_TEMP: f64 = 50.0;
+pub const OTP_THERMOREGULATION_TEMP: f64 = 40.0;

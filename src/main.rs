@@ -25,14 +25,13 @@ use husb238::{Command, Husb238};
 // global logger
 use panic_probe as _;
 
-use gx21m15::Gx21m15;
+use gx21m15::{Gx21m15, Gx21m15Config};
 use sgm41511::{types::Reg06Values, SGM41511};
-use shared::LED_LEVEL_STEP;
+use shared::{LED_LEVEL_STEP, OTP_HYSTERESIS_TEMP, OTP_SHUTDOWN_TEMP, OTP_THERMOREGULATION_TEMP};
 use static_cell::StaticCell;
 
 mod shared;
 
-static SPI_BUS_MUTEX: StaticCell<Mutex<CriticalSectionRawMutex, SpiBus>> = StaticCell::new();
 static HUSB238_I2C_MUTEX: StaticCell<Mutex<CriticalSectionRawMutex, I2c<'_, Async>>> =
     StaticCell::new();
 
@@ -66,6 +65,29 @@ async fn main(spawner: Spawner) {
 
     let i2c_dev = I2cDevice::new(&i2c);
     let mut pmic = SGM41511::new(i2c_dev);
+
+    let i2c_dev = I2cDevice::new(&i2c);
+    let mut temp_sensor = Gx21m15::new(i2c_dev, 0x48);
+
+    temp_sensor
+        .set_config(
+            Gx21m15Config::new()
+                .set_os_fail_queue_size(gx21m15::OsFailQueueSize::Four)
+                .set_os_mode(false)
+                .set_os_polarity(false),
+        )
+        .await
+        .unwrap();
+
+    temp_sensor
+        .set_temperature_over_shutdown(OTP_SHUTDOWN_TEMP as f32)
+        .await
+        .unwrap();
+    temp_sensor
+        .set_temperature_hysteresis(OTP_HYSTERESIS_TEMP as f32)
+        .await
+        .unwrap();
+
     let pmic_reversion = pmic.get_device_revision().await.unwrap();
 
     if pmic_reversion.is_none() {
@@ -152,14 +174,8 @@ async fn main(spawner: Spawner) {
         None,
         None,
         None,
-        Hertz(200000),
+        khz(30),
         embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
-    );
-    tim14.enable(embassy_stm32::timer::Channel::Ch1);
-
-    tim14.set_duty(
-        embassy_stm32::timer::Channel::Ch1,
-        tim14.get_max_duty() * 3 / 5,
     );
     fan_speed_pin.enable();
 
@@ -175,44 +191,87 @@ async fn main(spawner: Spawner) {
     let btn_ww_up = button_c;
     let btn_ww_down = button_d;
 
-    let mut btn_cw_level = 0f64;
-    let mut btn_ww_level = 0f64;
+    let mut led_cw_level = 0f64;
+    let mut led_ww_level = 0f64;
+    let mut otp_luminanc_ratio = 0f64;
+    let mut final_led_cw_level = 0f64;
+    let mut final_led_ww_level = 0f64;
+    let mut prev_led_cw_level = 0f64;
+    let mut prev_led_ww_level = 0f64;
 
     let mut ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
         if btn_cw_up.is_low() && btn_cw_down.is_high() {
-            btn_cw_level = (LED_LEVEL_STEP + btn_cw_level).min(1.0);
-            tim1.set_duty(
-                embassy_stm32::timer::Channel::Ch1,
-                (tim1.get_max_duty() as f64 * btn_cw_level) as u32,
-            );
-            defmt::info!("CW UP: {}", btn_cw_level);
+            led_cw_level = (LED_LEVEL_STEP + led_cw_level).min(1.0);
+            defmt::info!("CW UP: {}", led_cw_level);
         } else if btn_cw_up.is_high() && btn_cw_down.is_low() {
-            btn_cw_level = (btn_cw_level - LED_LEVEL_STEP).max(0.0);
-            tim1.set_duty(
-                embassy_stm32::timer::Channel::Ch1,
-                (tim1.get_max_duty() as f64 * btn_cw_level) as u32,
-            );
-            defmt::info!("CW DOWN: {}", btn_cw_level);
+            led_cw_level = (led_cw_level - LED_LEVEL_STEP).max(0.0);
+            defmt::info!("CW DOWN: {}", led_cw_level);
         }
 
         if btn_ww_up.is_low() && btn_ww_down.is_high() {
-            btn_ww_level = (LED_LEVEL_STEP + btn_ww_level).min(1.0);
-            tim1.set_duty(
-                embassy_stm32::timer::Channel::Ch2,
-                (tim1.get_max_duty() as f64 * btn_ww_level) as u32,
-            );
-            defmt::info!("WW UpAndDown: {}", btn_ww_level);
+            led_ww_level = (LED_LEVEL_STEP + led_ww_level).min(1.0);
+            defmt::info!("WW UpAndDown: {}", led_ww_level);
         } else if btn_ww_up.is_high() && btn_ww_down.is_low() {
-            btn_ww_level = (btn_ww_level - LED_LEVEL_STEP).max(0.0);
+            led_ww_level = (led_ww_level - LED_LEVEL_STEP).max(0.0);
             tim1.set_duty(
                 embassy_stm32::timer::Channel::Ch2,
-                (tim1.get_max_duty() as f64 * btn_ww_level) as u32,
+                (tim1.get_max_duty() as f64 * led_ww_level) as u32,
             );
-            defmt::info!("WW DOWN: {}", btn_ww_level);
+            defmt::info!("WW DOWN: {}", led_ww_level);
         }
-        
+
+        let temperator = temp_sensor.get_temperature().await;
+
+        if let Ok(temp) = temperator {
+            let temp = temp as f64;
+            if temp > OTP_THERMOREGULATION_TEMP {
+                otp_luminanc_ratio =
+                    (OTP_SHUTDOWN_TEMP - temp) / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
+
+                otp_luminanc_ratio = otp_luminanc_ratio.max(0.0).min(1.0);
+                defmt::info!(
+                    "Temperature: {}. Luminanc ratio: {}",
+                    temperator,
+                    otp_luminanc_ratio
+                );
+
+                let tim14_max_duty = tim14.get_max_duty();
+                let fan_spped =
+                    (tim14_max_duty as f64 * (1.0 - otp_luminanc_ratio + 0.15).max(1.0)) as u32;
+                tim14.set_duty(embassy_stm32::timer::Channel::Ch1, fan_spped);
+                tim14.enable(embassy_stm32::timer::Channel::Ch1);
+            } else {
+                tim14.disable(embassy_stm32::timer::Channel::Ch1);
+                defmt::info!("Temperature: {}", temperator);
+            }
+        }
+
+        let tim1_max_duty = tim1.get_max_duty() as f64;
+        final_led_cw_level = tim1_max_duty * led_cw_level * otp_luminanc_ratio;
+        final_led_ww_level = tim1_max_duty * led_ww_level * otp_luminanc_ratio;
+
+        if final_led_cw_level != prev_led_cw_level {
+            prev_led_cw_level = final_led_cw_level;
+            defmt::info!("CW: {}", final_led_cw_level);
+
+            tim1.set_duty(
+                embassy_stm32::timer::Channel::Ch1,
+                final_led_cw_level as u32,
+            );
+        }
+
+        if final_led_ww_level != prev_led_ww_level {
+            prev_led_ww_level = final_led_ww_level;
+            defmt::info!("WW: {}", final_led_ww_level);
+
+            tim1.set_duty(
+                embassy_stm32::timer::Channel::Ch2,
+                final_led_ww_level as u32,
+            );
+        }
+
         ticker.next().await;
     }
 }
