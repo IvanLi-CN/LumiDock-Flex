@@ -193,58 +193,51 @@ async fn main(spawner: Spawner) {
 
     let mut led_cw_level = 0f64;
     let mut led_ww_level = 0f64;
-    let mut otp_luminanc_ratio = 0f64;
+    let mut otp_luminanc_ratio = 1.0f64;
     let mut final_led_cw_level = 0f64;
     let mut final_led_ww_level = 0f64;
     let mut prev_led_cw_level = 0f64;
     let mut prev_led_ww_level = 0f64;
+    let mut otp_detect_count = 0u8;
 
     let mut ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
         if btn_cw_up.is_low() && btn_cw_down.is_high() {
             led_cw_level = (LED_LEVEL_STEP + led_cw_level).min(1.0);
-            defmt::info!("CW UP: {}", led_cw_level);
         } else if btn_cw_up.is_high() && btn_cw_down.is_low() {
             led_cw_level = (led_cw_level - LED_LEVEL_STEP).max(0.0);
-            defmt::info!("CW DOWN: {}", led_cw_level);
         }
 
         if btn_ww_up.is_low() && btn_ww_down.is_high() {
             led_ww_level = (LED_LEVEL_STEP + led_ww_level).min(1.0);
-            defmt::info!("WW UpAndDown: {}", led_ww_level);
         } else if btn_ww_up.is_high() && btn_ww_down.is_low() {
             led_ww_level = (led_ww_level - LED_LEVEL_STEP).max(0.0);
-            tim1.set_duty(
-                embassy_stm32::timer::Channel::Ch2,
-                (tim1.get_max_duty() as f64 * led_ww_level) as u32,
-            );
-            defmt::info!("WW DOWN: {}", led_ww_level);
         }
 
-        let temperator = temp_sensor.get_temperature().await;
+        otp_detect_count += 1;
+        if otp_detect_count > 100 {
+            otp_detect_count = 0;
 
-        if let Ok(temp) = temperator {
-            let temp = temp as f64;
-            if temp > OTP_THERMOREGULATION_TEMP {
-                otp_luminanc_ratio =
-                    (OTP_SHUTDOWN_TEMP - temp) / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
+            let temperator = temp_sensor.get_temperature().await;
 
-                otp_luminanc_ratio = otp_luminanc_ratio.max(0.0).min(1.0);
-                defmt::info!(
-                    "Temperature: {}. Luminanc ratio: {}",
-                    temperator,
-                    otp_luminanc_ratio
-                );
+            if let Ok(temp) = temperator {
+                let temp = temp as f64;
+                if temp > OTP_THERMOREGULATION_TEMP {
+                    otp_luminanc_ratio = (OTP_SHUTDOWN_TEMP - temp)
+                        / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
 
-                let tim14_max_duty = tim14.get_max_duty();
-                let fan_spped =
-                    (tim14_max_duty as f64 * (1.0 - otp_luminanc_ratio + 0.15).max(1.0)) as u32;
-                tim14.set_duty(embassy_stm32::timer::Channel::Ch1, fan_spped);
-                tim14.enable(embassy_stm32::timer::Channel::Ch1);
-            } else {
-                tim14.disable(embassy_stm32::timer::Channel::Ch1);
-                defmt::info!("Temperature: {}", temperator);
+                    otp_luminanc_ratio = otp_luminanc_ratio.max(0.0).min(1.0);
+
+                    let tim14_max_duty = tim14.get_max_duty();
+                    let fan_spped =
+                        (tim14_max_duty as f64 * (1.0 - otp_luminanc_ratio + 0.15).max(1.0)) as u32;
+                    tim14.set_duty(embassy_stm32::timer::Channel::Ch1, fan_spped);
+                    tim14.enable(embassy_stm32::timer::Channel::Ch1);
+                } else {
+                    otp_luminanc_ratio = 1.0;
+                    tim14.disable(embassy_stm32::timer::Channel::Ch1);
+                }
             }
         }
 
@@ -254,7 +247,6 @@ async fn main(spawner: Spawner) {
 
         if final_led_cw_level != prev_led_cw_level {
             prev_led_cw_level = final_led_cw_level;
-            defmt::info!("CW: {}", final_led_cw_level);
 
             tim1.set_duty(
                 embassy_stm32::timer::Channel::Ch1,
@@ -264,7 +256,6 @@ async fn main(spawner: Spawner) {
 
         if final_led_ww_level != prev_led_ww_level {
             prev_led_ww_level = final_led_ww_level;
-            defmt::info!("WW: {}", final_led_ww_level);
 
             tim1.set_duty(
                 embassy_stm32::timer::Channel::Ch2,
