@@ -21,7 +21,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 
 use defmt_rtt as _;
 use embassy_time::{Duration, Ticker};
-use husb238::{Command, Husb238};
+use husb238::{Command, Husb238, Voltage};
 // global logger
 use panic_probe as _;
 
@@ -200,7 +200,7 @@ async fn main(spawner: Spawner) {
     let mut otp_fan_ratio = 1.0f64;
     let mut prev_led_cw_level = 0f64;
     let mut prev_led_ww_level = 0f64;
-    let mut otp_detect_count = 0u8;
+    let mut count_for_exec_task = 0u8;
 
     let mut ticker = Ticker::every(Duration::from_millis(20));
 
@@ -217,16 +217,15 @@ async fn main(spawner: Spawner) {
             led_ww_level = (led_ww_level - LED_LEVEL_STEP).max(0.0);
         }
 
-        otp_detect_count += 1;
-        if otp_detect_count > 100 {
-            otp_detect_count = 0;
+        count_for_exec_task += 1;
+        if count_for_exec_task > 100 {
+            count_for_exec_task = 0;
 
             let temperate = temp_sensor.get_temperature().await;
-
             if let Ok(temp) = temperate {
                 let temp = temp as f64;
                 if temp > OTP_THERMOREGULATION_TEMP {
-                   let otp_ratio = (OTP_SHUTDOWN_TEMP - temp)
+                    let otp_ratio = (OTP_SHUTDOWN_TEMP - temp)
                         / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
 
                     // During thermal control,
@@ -261,6 +260,18 @@ async fn main(spawner: Spawner) {
                 } else {
                     otp_luminance_ratio = 1.0;
                     tim14.disable(embassy_stm32::timer::Channel::Ch1);
+                }
+            }
+
+            let curr_pdo = sink.get_actual_voltage_and_current().await;
+            if let Ok((volts, _)) = curr_pdo {
+                defmt::info!("Current Inpot voltage: {} V", volts);
+
+                if volts == Some(5.0) || volts.is_none() {
+                    sink.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
+                    sink.go_command(husb238::Command::Request).await.unwrap();
+
+                    defmt::info!("Requested 12 V");
                 }
             }
         }
