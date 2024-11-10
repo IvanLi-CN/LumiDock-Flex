@@ -116,8 +116,8 @@ async fn main(spawner: Spawner) {
 
     let i2c_dev = I2cDevice::new(&i2c);
 
-    let mut husb238 = Husb238::new(i2c_dev);
-    match husb238.get_9v_status().await {
+    let mut sink = Husb238::new(i2c_dev);
+    match sink.get_9v_status().await {
         Ok(status) => {
             if let Some(status) = status {
                 defmt::info!("9v status: {:?}", status);
@@ -127,7 +127,7 @@ async fn main(spawner: Spawner) {
         }
         Err(_) => {}
     }
-    match husb238.get_12v_status().await {
+    match sink.get_12v_status().await {
         Ok(status) => {
             if let Some(status) = status {
                 defmt::info!("12v status: {:?}", status);
@@ -137,8 +137,8 @@ async fn main(spawner: Spawner) {
         }
         Err(_) => {}
     }
-    husb238.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
-    husb238.go_command(Command::Request).await.unwrap();
+    sink.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
+    sink.go_command(Command::Request).await.unwrap();
 
     let led_a_pin = PwmPin::new_ch1(p.PA8, OutputType::PushPull);
     let led_b_pin = PwmPin::new_ch2(p.PB3, OutputType::PushPull);
@@ -196,11 +196,8 @@ async fn main(spawner: Spawner) {
 
     let mut led_cw_level = 0f64;
     let mut led_ww_level = 0f64;
-    let mut otp_ratio = 1.0f64;
     let mut otp_luminance_ratio = 1.0f64;
     let mut otp_fan_ratio = 1.0f64;
-    let mut final_led_cw_level = 0f64;
-    let mut final_led_ww_level = 0f64;
     let mut prev_led_cw_level = 0f64;
     let mut prev_led_ww_level = 0f64;
     let mut otp_detect_count = 0u8;
@@ -224,12 +221,12 @@ async fn main(spawner: Spawner) {
         if otp_detect_count > 100 {
             otp_detect_count = 0;
 
-            let temperator = temp_sensor.get_temperature().await;
+            let temperate = temp_sensor.get_temperature().await;
 
-            if let Ok(temp) = temperator {
+            if let Ok(temp) = temperate {
                 let temp = temp as f64;
                 if temp > OTP_THERMOREGULATION_TEMP {
-                    otp_ratio = (OTP_SHUTDOWN_TEMP - temp)
+                   let otp_ratio = (OTP_SHUTDOWN_TEMP - temp)
                         / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
 
                     // During thermal control,
@@ -269,8 +266,8 @@ async fn main(spawner: Spawner) {
         }
 
         let tim1_max_duty = tim1.get_max_duty() as f64;
-        final_led_cw_level = tim1_max_duty * led_cw_level * otp_luminance_ratio;
-        final_led_ww_level = tim1_max_duty * led_ww_level * otp_luminance_ratio;
+        let final_led_cw_level = tim1_max_duty * led_cw_level * otp_luminance_ratio;
+        let final_led_ww_level = tim1_max_duty * led_ww_level * otp_luminance_ratio;
 
         if final_led_cw_level != prev_led_cw_level {
             prev_led_cw_level = final_led_cw_level;
