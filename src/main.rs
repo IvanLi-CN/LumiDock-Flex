@@ -27,7 +27,10 @@ use panic_probe as _;
 
 use gx21m15::{Gx21m15, Gx21m15Config};
 use sgm41511::{types::Reg06Values, SGM41511};
-use shared::{LED_LEVEL_STEP, OTP_HYSTERESIS_TEMP, OTP_SHUTDOWN_TEMP, OTP_THERMOREGULATION_TEMP};
+use shared::{
+    FAN_MINIMUM_DUTY_CYCLE, LED_LEVEL_STEP, OTP_HYSTERESIS_TEMP, OTP_SHUTDOWN_TEMP,
+    OTP_THERMOREGULATION_TEMP,
+};
 use static_cell::StaticCell;
 
 mod shared;
@@ -193,7 +196,9 @@ async fn main(spawner: Spawner) {
 
     let mut led_cw_level = 0f64;
     let mut led_ww_level = 0f64;
-    let mut otp_luminanc_ratio = 1.0f64;
+    let mut otp_ratio = 1.0f64;
+    let mut otp_luminance_ratio = 1.0f64;
+    let mut otp_fan_ratio = 1.0f64;
     let mut final_led_cw_level = 0f64;
     let mut final_led_ww_level = 0f64;
     let mut prev_led_cw_level = 0f64;
@@ -224,26 +229,48 @@ async fn main(spawner: Spawner) {
             if let Ok(temp) = temperator {
                 let temp = temp as f64;
                 if temp > OTP_THERMOREGULATION_TEMP {
-                    otp_luminanc_ratio = (OTP_SHUTDOWN_TEMP - temp)
+                    otp_ratio = (OTP_SHUTDOWN_TEMP - temp)
                         / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
 
-                    otp_luminanc_ratio = otp_luminanc_ratio.max(0.0).min(1.0);
+                    // During thermal control,
+                    // reduce the brightness in the last 50% of the allowable range
+                    // to avoid thermal runaway
+
+                    otp_luminance_ratio = (if otp_ratio < 0.5 {
+                        otp_ratio * 2.0
+                    } else {
+                        1.0
+                    })
+                    .max(0.0)
+                    .min(1.0);
+
+                    // For thermal control,
+                    // the first 50% of the tolerance range is gradually increased to 100%
+                    // to provide thermal enhancement.
+
+                    otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
 
                     let tim14_max_duty = tim14.get_max_duty();
-                    let fan_spped =
-                        (tim14_max_duty as f64 * (1.0 - otp_luminanc_ratio + 0.15).max(1.0)) as u32;
-                    tim14.set_duty(embassy_stm32::timer::Channel::Ch1, fan_spped);
+                    let fan_speed =
+                        ((tim14_max_duty as f64 * otp_fan_ratio) as u32).min(tim14_max_duty);
+                    tim14.set_duty(embassy_stm32::timer::Channel::Ch1, fan_speed);
                     tim14.enable(embassy_stm32::timer::Channel::Ch1);
+                    defmt::info!(
+                        "Temperature: {}\t Fan speed: {}\tLight level: {}",
+                        temp,
+                        otp_fan_ratio,
+                        otp_luminance_ratio
+                    );
                 } else {
-                    otp_luminanc_ratio = 1.0;
+                    otp_luminance_ratio = 1.0;
                     tim14.disable(embassy_stm32::timer::Channel::Ch1);
                 }
             }
         }
 
         let tim1_max_duty = tim1.get_max_duty() as f64;
-        final_led_cw_level = tim1_max_duty * led_cw_level * otp_luminanc_ratio;
-        final_led_ww_level = tim1_max_duty * led_ww_level * otp_luminanc_ratio;
+        final_led_cw_level = tim1_max_duty * led_cw_level * otp_luminance_ratio;
+        final_led_ww_level = tim1_max_duty * led_ww_level * otp_luminance_ratio;
 
         if final_led_cw_level != prev_led_cw_level {
             prev_led_cw_level = final_led_cw_level;
