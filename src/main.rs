@@ -117,28 +117,6 @@ async fn main(spawner: Spawner) {
     let i2c_dev = I2cDevice::new(&i2c);
 
     let mut sink = Husb238::new(i2c_dev);
-    match sink.get_9v_status().await {
-        Ok(status) => {
-            if let Some(status) = status {
-                defmt::info!("9v status: {:?}", status);
-            } else {
-                defmt::info!("9v status: None");
-            }
-        }
-        Err(_) => {}
-    }
-    match sink.get_12v_status().await {
-        Ok(status) => {
-            if let Some(status) = status {
-                defmt::info!("12v status: {:?}", status);
-            } else {
-                defmt::info!("12v status: None");
-            }
-        }
-        Err(_) => {}
-    }
-    sink.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
-    sink.go_command(Command::Request).await.unwrap();
 
     let led_a_pin = PwmPin::new_ch1(p.PA8, OutputType::PushPull);
     let led_b_pin = PwmPin::new_ch2(p.PB3, OutputType::PushPull);
@@ -197,7 +175,6 @@ async fn main(spawner: Spawner) {
     let mut led_cw_level = 0f64;
     let mut led_ww_level = 0f64;
     let mut otp_luminance_ratio = 1.0f64;
-    let mut otp_fan_ratio = 1.0f64;
     let mut prev_led_cw_level = 0f64;
     let mut prev_led_ww_level = 0f64;
     let mut count_for_exec_task = 0u8;
@@ -205,6 +182,8 @@ async fn main(spawner: Spawner) {
     let mut ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
+        // Buttons
+
         if btn_cw_up.is_low() && btn_cw_down.is_high() {
             led_cw_level = (LED_LEVEL_STEP + led_cw_level).min(1.0);
         } else if btn_cw_up.is_high() && btn_cw_down.is_low() {
@@ -244,7 +223,7 @@ async fn main(spawner: Spawner) {
                     // the first 50% of the tolerance range is gradually increased to 100%
                     // to provide thermal enhancement.
 
-                    otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
+                    let otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
 
                     let tim14_max_duty = tim14.get_max_duty();
                     let fan_speed =
@@ -268,10 +247,24 @@ async fn main(spawner: Spawner) {
                 defmt::info!("Current Inpot voltage: {} V", volts);
 
                 if volts == Some(5.0) || volts.is_none() {
-                    sink.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
-                    sink.go_command(husb238::Command::Request).await.unwrap();
+                    let status = sink.get_12v_status().await.unwrap();
 
-                    defmt::info!("Requested 12 V");
+                    if let Some(status) = status {
+                        defmt::info!("12v status: {:?}", status);
+
+                        sink.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
+                        sink.go_command(Command::Request).await.unwrap();
+                    } else {
+                        let status = sink.get_9v_status().await.unwrap();
+
+                        if let Some(status) = status {
+                            defmt::info!("9v status: {:?}", status);
+                            sink.set_src_pdo(husb238::SrcPdo::_9v).await.unwrap();
+                            sink.go_command(Command::Request).await.unwrap();
+                        } else {
+                            defmt::warn!("not support 9v or 12v");
+                        }
+                    }
                 }
             }
         }
