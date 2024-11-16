@@ -16,7 +16,9 @@ use embassy_stm32::{
     time::{khz, Hertz},
     timer::simple_pwm::{PwmPin, SimplePwm},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
+};
 
 use defmt_rtt as _;
 use embassy_time::{Duration, Ticker};
@@ -48,6 +50,9 @@ static ADC_INSTANCE: StaticCell<Adc<'static, ADC1>> = StaticCell::new();
 
 static OTP_LUMINANCE_RATIO: Mutex<CriticalSectionRawMutex, f64> = Mutex::new(1.0); // 1.0 = 100%
 
+static TEMPERATURE_SIGNAL: Signal<CriticalSectionRawMutex, f64> = Signal::new();
+static BUS_VOLTAGE_SIGNAL: Signal<CriticalSectionRawMutex, f64> = Signal::new();
+
 bind_interrupts!(struct Irqs {
     I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>, i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
@@ -58,7 +63,6 @@ static mut DMA_BUF: [u16; 4] = [0; 4];
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-
     let p = embassy_stm32::init(Default::default());
 
     defmt::println!("Hello, LumiDock Flex!");
@@ -179,7 +183,7 @@ async fn main(spawner: Spawner) {
 
     // Spawn tasks
 
-    spawner.spawn(otp_task(temp_sensor, tim14)).unwrap();
+    spawner.spawn(otp_task(tim14)).unwrap();
     spawner.spawn(dp_sink_task(sink)).unwrap();
     spawner
         .spawn(adc_task(adc, dma, vrefint_ch, vbus_ch, vcc_ch, temp_ch))
@@ -244,9 +248,6 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn otp_task(
-    mut sensor: Gx21m15<
-        &'static mut I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, Async>>,
-    >,
     tim: &'static mut SimplePwm<'static, peripherals::TIM14>,
 ) {
     let mut pwm_ch = tim.ch1();
@@ -254,59 +255,53 @@ async fn otp_task(
     pwm_ch.set_duty_cycle_fully_on();
     pwm_ch.enable();
 
-    let mut ticker = Ticker::every(Duration::from_millis(5000));
     let mut otp_luminance_ratio = 0f64;
 
     loop {
-        ticker.next().await;
+        let temperate = TEMPERATURE_SIGNAL.wait().await;
+        if temperate > OTP_THERMOREGULATION_TEMP {
+            let otp_ratio =
+                (OTP_SHUTDOWN_TEMP - temperate) / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
 
-        let temperate = sensor.get_temperature().await;
-        if let Ok(temp) = temperate {
-            let temp = temp as f64;
-            if temp > OTP_THERMOREGULATION_TEMP {
-                let otp_ratio =
-                    (OTP_SHUTDOWN_TEMP - temp) / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
+            // During thermal control,
+            // reduce the brightness in the last 50% of the allowable range
+            // to avoid thermal runaway
 
-                // During thermal control,
-                // reduce the brightness in the last 50% of the allowable range
-                // to avoid thermal runaway
-
-                otp_luminance_ratio = (if otp_ratio < 0.5 {
-                    otp_ratio * 2.0
-                } else {
-                    1.0
-                })
-                .max(0.0)
-                .min(1.0);
-
-                let mut otp_luminance_ratio_guard = OTP_LUMINANCE_RATIO.lock().await;
-                *otp_luminance_ratio_guard = otp_luminance_ratio;
-                drop(otp_luminance_ratio_guard);
-
-                // For thermal control,
-                // the first 50% of the tolerance range is gradually increased to 100%
-                // to provide thermal enhancement.
-
-                let otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
-
-                let fan_speed = ((otp_fan_ratio * 100.0) as u32).min(100);
-                pwm_ch.set_duty_cycle_percent(fan_speed as u8);
-                pwm_ch.enable();
-                defmt::info!(
-                    "Temperature: {}\t Fan speed: {}\tLight level: {}",
-                    temp,
-                    otp_fan_ratio,
-                    otp_luminance_ratio
-                );
+            otp_luminance_ratio = (if otp_ratio < 0.5 {
+                otp_ratio * 2.0
             } else {
-                if otp_luminance_ratio != 1.0 {
-                    let mut otp_luminance_ratio_guard = OTP_LUMINANCE_RATIO.lock().await;
-                    *otp_luminance_ratio_guard = 1.0;
-                    drop(otp_luminance_ratio_guard);
-                    otp_luminance_ratio = 1.0;
-                }
-                pwm_ch.disable();
+                1.0
+            })
+            .max(0.0)
+            .min(1.0);
+
+            let mut otp_luminance_ratio_guard = OTP_LUMINANCE_RATIO.lock().await;
+            *otp_luminance_ratio_guard = otp_luminance_ratio;
+            drop(otp_luminance_ratio_guard);
+
+            // For thermal control,
+            // the first 50% of the tolerance range is gradually increased to 100%
+            // to provide thermal enhancement.
+
+            let otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
+
+            let fan_speed = ((otp_fan_ratio * 100.0) as u32).min(100);
+            pwm_ch.set_duty_cycle_percent(fan_speed as u8);
+            pwm_ch.enable();
+            defmt::info!(
+                "Temperature: {}\t Fan speed: {}\tLight level: {}",
+                temperate,
+                otp_fan_ratio,
+                otp_luminance_ratio
+            );
+        } else {
+            if otp_luminance_ratio != 1.0 {
+                let mut otp_luminance_ratio_guard = OTP_LUMINANCE_RATIO.lock().await;
+                *otp_luminance_ratio_guard = 1.0;
+                drop(otp_luminance_ratio_guard);
+                otp_luminance_ratio = 1.0;
             }
+            pwm_ch.disable();
         }
     }
 }
@@ -391,6 +386,9 @@ async fn adc_task(
         let temp_degrees = (130 - 30) as f64 / (ts_cal2 - ts_cal1) as f64
             * (read_buffer[2] - ts_cal1) as f64
             + 30.0;
+
+        TEMPERATURE_SIGNAL.signal(temp_degrees);
+        BUS_VOLTAGE_SIGNAL.signal(vbus);
 
         defmt::info!(
             "ADC: {},\t Temp: {}, Vdda: {}, \t Vbus: {}, \t Vcc: {}",
