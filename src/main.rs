@@ -35,8 +35,18 @@ use static_cell::StaticCell;
 
 mod shared;
 
-static HUSB238_I2C_MUTEX: StaticCell<Mutex<CriticalSectionRawMutex, I2c<'_, Async>>> =
+static I2C_MUTEX: StaticCell<Mutex<CriticalSectionRawMutex, I2c<'static, Async>>> =
     StaticCell::new();
+static TEMP_SENSOR_I2C_DEVICE: StaticCell<
+    I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, Async>>,
+> = StaticCell::new();
+static DP_SINK_I2C_DEVICE: StaticCell<
+    I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, Async>>,
+> = StaticCell::new();
+
+static TIM14: StaticCell<SimplePwm<'static, peripherals::TIM14>> = StaticCell::new();
+
+static OTP_LUMINANCE_RATIO: Mutex<CriticalSectionRawMutex, f64> = Mutex::new(1.0); // 1.0 = 100%
 
 bind_interrupts!(struct Irqs {
     I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>, i2c::ErrorInterruptHandler<peripherals::I2C1>;
@@ -64,12 +74,11 @@ async fn main(spawner: Spawner) {
     );
 
     let i2c = Mutex::new(i2c);
-    let i2c = HUSB238_I2C_MUTEX.init(i2c);
-
+    let i2c = I2C_MUTEX.init(i2c);
     let i2c_dev = I2cDevice::new(&i2c);
     let mut pmic = SGM41511::new(i2c_dev);
 
-    let i2c_dev = I2cDevice::new(&i2c);
+    let i2c_dev = TEMP_SENSOR_I2C_DEVICE.init(I2cDevice::new(i2c));
     let mut temp_sensor = Gx21m15::new(i2c_dev, 0x48);
 
     temp_sensor
@@ -114,9 +123,9 @@ async fn main(spawner: Spawner) {
         .await
         .unwrap();
 
-    let i2c_dev = I2cDevice::new(&i2c);
-
-    let mut sink = Husb238::new(i2c_dev);
+    let i2c_dev = I2cDevice::new(i2c);
+    let i2c_dev = DP_SINK_I2C_DEVICE.init(i2c_dev);
+    let sink = Husb238::new(i2c_dev);
 
     let led_a_pin = PwmPin::new_ch1(p.PA8, OutputType::PushPull);
     let led_b_pin = PwmPin::new_ch2(p.PB3, OutputType::PushPull);
@@ -149,7 +158,7 @@ async fn main(spawner: Spawner) {
     );
     let fan_ctrl_pin = PwmPin::new_ch1(p.PB1, OutputType::PushPull);
 
-    let mut tim14 = SimplePwm::new(
+    let tim14 = SimplePwm::new(
         p.TIM14,
         Some(fan_ctrl_pin),
         None,
@@ -158,7 +167,11 @@ async fn main(spawner: Spawner) {
         khz(30),
         embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
     );
+    let tim14 = TIM14.init(tim14);
     fan_speed_pin.enable();
+
+    spawner.spawn(otp_task(temp_sensor, tim14)).unwrap();
+    spawner.spawn(dp_sink_task(sink)).unwrap();
 
     // init buttons
 
@@ -174,14 +187,16 @@ async fn main(spawner: Spawner) {
 
     let mut led_cw_level = 0f64;
     let mut led_ww_level = 0f64;
-    let mut otp_luminance_ratio = 1.0f64;
     let mut prev_led_cw_level = 0f64;
     let mut prev_led_ww_level = 0f64;
-    let mut count_for_exec_task = 0u8;
 
     let mut ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
+        let guard = OTP_LUMINANCE_RATIO.lock().await;
+        let otp_luminance_ratio = *guard;
+        drop(guard);
+
         // Buttons
 
         if btn_cw_up.is_low() && btn_cw_down.is_high() {
@@ -194,79 +209,6 @@ async fn main(spawner: Spawner) {
             led_ww_level = (LED_LEVEL_STEP + led_ww_level).min(1.0);
         } else if btn_ww_up.is_high() && btn_ww_down.is_low() {
             led_ww_level = (led_ww_level - LED_LEVEL_STEP).max(0.0);
-        }
-
-        count_for_exec_task += 1;
-        if count_for_exec_task > 100 {
-            count_for_exec_task = 0;
-
-            let temperate = temp_sensor.get_temperature().await;
-            if let Ok(temp) = temperate {
-                let temp = temp as f64;
-                if temp > OTP_THERMOREGULATION_TEMP {
-                    let otp_ratio = (OTP_SHUTDOWN_TEMP - temp)
-                        / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
-
-                    // During thermal control,
-                    // reduce the brightness in the last 50% of the allowable range
-                    // to avoid thermal runaway
-
-                    otp_luminance_ratio = (if otp_ratio < 0.5 {
-                        otp_ratio * 2.0
-                    } else {
-                        1.0
-                    })
-                    .max(0.0)
-                    .min(1.0);
-
-                    // For thermal control,
-                    // the first 50% of the tolerance range is gradually increased to 100%
-                    // to provide thermal enhancement.
-
-                    let otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
-
-                    let tim14_max_duty = tim14.get_max_duty();
-                    let fan_speed =
-                        ((tim14_max_duty as f64 * otp_fan_ratio) as u32).min(tim14_max_duty);
-                    tim14.set_duty(embassy_stm32::timer::Channel::Ch1, fan_speed);
-                    tim14.enable(embassy_stm32::timer::Channel::Ch1);
-                    defmt::info!(
-                        "Temperature: {}\t Fan speed: {}\tLight level: {}",
-                        temp,
-                        otp_fan_ratio,
-                        otp_luminance_ratio
-                    );
-                } else {
-                    otp_luminance_ratio = 1.0;
-                    tim14.disable(embassy_stm32::timer::Channel::Ch1);
-                }
-            }
-
-            let curr_pdo = sink.get_actual_voltage_and_current().await;
-            if let Ok((volts, _)) = curr_pdo {
-                defmt::info!("Current Inpot voltage: {} V", volts);
-
-                if volts == Some(5.0) || volts.is_none() {
-                    let status = sink.get_12v_status().await.unwrap();
-
-                    if let Some(status) = status {
-                        defmt::info!("12v status: {:?}", status);
-
-                        sink.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
-                        sink.go_command(Command::Request).await.unwrap();
-                    } else {
-                        let status = sink.get_9v_status().await.unwrap();
-
-                        if let Some(status) = status {
-                            defmt::info!("9v status: {:?}", status);
-                            sink.set_src_pdo(husb238::SrcPdo::_9v).await.unwrap();
-                            sink.go_command(Command::Request).await.unwrap();
-                        } else {
-                            defmt::warn!("not support 9v or 12v");
-                        }
-                    }
-                }
-            }
         }
 
         let tim1_max_duty = tim1.get_max_duty() as f64;
@@ -292,5 +234,114 @@ async fn main(spawner: Spawner) {
         }
 
         ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn otp_task(
+    mut sensor: Gx21m15<
+        &'static mut I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, Async>>,
+    >,
+    tim: &'static mut SimplePwm<'static, peripherals::TIM14>,
+) {
+    let tim14_max_duty = tim.get_max_duty();
+
+    tim.set_duty(embassy_stm32::timer::Channel::Ch1, tim14_max_duty);
+    tim.enable(embassy_stm32::timer::Channel::Ch1);
+
+    let mut ticker = Ticker::every(Duration::from_millis(5000));
+    let mut otp_luminance_ratio = 0f64;
+
+    loop {
+        ticker.next().await;
+
+        let temperate = sensor.get_temperature().await;
+        if let Ok(temp) = temperate {
+            let temp = temp as f64;
+            if temp > OTP_THERMOREGULATION_TEMP {
+                let otp_ratio =
+                    (OTP_SHUTDOWN_TEMP - temp) / (OTP_SHUTDOWN_TEMP - OTP_THERMOREGULATION_TEMP);
+
+                // During thermal control,
+                // reduce the brightness in the last 50% of the allowable range
+                // to avoid thermal runaway
+
+                otp_luminance_ratio = (if otp_ratio < 0.5 {
+                    otp_ratio * 2.0
+                } else {
+                    1.0
+                })
+                .max(0.0)
+                .min(1.0);
+
+                let mut otp_luminance_ratio_guard = OTP_LUMINANCE_RATIO.lock().await;
+                *otp_luminance_ratio_guard = otp_luminance_ratio;
+                drop(otp_luminance_ratio_guard);
+
+                // For thermal control,
+                // the first 50% of the tolerance range is gradually increased to 100%
+                // to provide thermal enhancement.
+
+                let otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
+
+                let fan_speed =
+                    ((tim14_max_duty as f64 * otp_fan_ratio) as u32).min(tim14_max_duty);
+                tim.set_duty(embassy_stm32::timer::Channel::Ch1, fan_speed);
+                tim.enable(embassy_stm32::timer::Channel::Ch1);
+                defmt::info!(
+                    "Temperature: {}\t Fan speed: {}\tLight level: {}",
+                    temp,
+                    otp_fan_ratio,
+                    otp_luminance_ratio
+                );
+            } else {
+                if otp_luminance_ratio != 1.0 {
+                    let mut otp_luminance_ratio_guard = OTP_LUMINANCE_RATIO.lock().await;
+                    *otp_luminance_ratio_guard = 1.0;
+                    drop(otp_luminance_ratio_guard);
+                    otp_luminance_ratio = 1.0;
+                }
+                tim.disable(embassy_stm32::timer::Channel::Ch1);
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn dp_sink_task(
+    mut sink: Husb238<
+        &'static mut I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, Async>>,
+    >,
+) {
+    let mut ticker = Ticker::every(Duration::from_millis(10_000));
+
+    loop {
+        ticker.next().await;
+
+        let curr_pdo = sink.get_actual_voltage_and_current().await;
+        if let Ok((volts, _)) = curr_pdo {
+            defmt::info!("Current Input voltage: {} V", volts);
+
+            if volts == Some(5.0) || volts.is_none() {
+                let status = sink.get_12v_status().await.unwrap();
+
+                if let Some(status) = status {
+                    defmt::info!("12v status: {:?}", status);
+
+                    sink.set_src_pdo(husb238::SrcPdo::_12v).await.unwrap();
+                    sink.go_command(Command::Request).await.unwrap();
+                } else {
+                    let status = sink.get_9v_status().await.unwrap();
+
+                    if let Some(status) = status {
+                        defmt::info!("9v status: {:?}", status);
+                        sink.set_src_pdo(husb238::SrcPdo::_9v).await.unwrap();
+                        sink.go_command(Command::Request).await.unwrap();
+                    } else {
+                        defmt::warn!("not support 9v or 12v");
+                    }
+                }
+            }
+        }
     }
 }
