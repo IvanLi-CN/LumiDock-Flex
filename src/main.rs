@@ -1,34 +1,33 @@
 #![no_std]
 #![no_main]
 
+use core::ptr::read_volatile;
+
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_stm32::{
+    adc::{Adc, AdcChannel, AnyAdcChannel, Resolution, SampleTime},
     bind_interrupts,
     exti::ExtiInput,
     gpio::{OutputType, Pull},
     i2c::{self, I2c},
     mode::Async,
-    peripherals::{self},
+    peripherals::{self, ADC1, DMA1_CH1},
     time::{khz, Hertz},
-    timer::{
-        pwm_input::PwmInput,
-        simple_pwm::{PwmPin, SimplePwm},
-    },
-    Peripheral,
+    timer::simple_pwm::{PwmPin, SimplePwm},
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 
 use defmt_rtt as _;
 use embassy_time::{Duration, Ticker};
-use husb238::{Command, Husb238, Voltage};
+use husb238::{Command, Husb238};
 // global logger
 use panic_probe as _;
 
 use gx21m15::{Gx21m15, Gx21m15Config};
 use sgm41511::{types::Reg06Values, SGM41511};
 use shared::{
-    FAN_MINIMUM_DUTY_CYCLE, LED_LEVEL_STEP, OTP_HYSTERESIS_TEMP, OTP_SHUTDOWN_TEMP,
+    ADC_DIVIDER, FAN_MINIMUM_DUTY_CYCLE, LED_LEVEL_STEP, OTP_HYSTERESIS_TEMP, OTP_SHUTDOWN_TEMP,
     OTP_THERMOREGULATION_TEMP,
 };
 use static_cell::StaticCell;
@@ -45,6 +44,7 @@ static DP_SINK_I2C_DEVICE: StaticCell<
 > = StaticCell::new();
 
 static TIM14: StaticCell<SimplePwm<'static, peripherals::TIM14>> = StaticCell::new();
+static ADC_INSTANCE: StaticCell<Adc<'static, ADC1>> = StaticCell::new();
 
 static OTP_LUMINANCE_RATIO: Mutex<CriticalSectionRawMutex, f64> = Mutex::new(1.0); // 1.0 = 100%
 
@@ -52,10 +52,13 @@ bind_interrupts!(struct Irqs {
     I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>, i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
 
+static mut DMA_BUF: [u16; 4] = [0; 4];
+
 // This marks the entrypoint of our application.
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+
     let p = embassy_stm32::init(Default::default());
 
     defmt::println!("Hello, LumiDock Flex!");
@@ -129,33 +132,26 @@ async fn main(spawner: Spawner) {
 
     let led_a_pin = PwmPin::new_ch1(p.PA8, OutputType::PushPull);
     let led_b_pin = PwmPin::new_ch2(p.PB3, OutputType::PushPull);
-    let blk_pin = PwmPin::new_ch3(p.PB6, OutputType::PushPull);
 
-    let mut tim1 = SimplePwm::new(
+    let tim1 = SimplePwm::new(
         p.TIM1,
         Some(led_a_pin),
         Some(led_b_pin),
-        Some(blk_pin),
+        None,
         None,
         khz(10),
         embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
     );
 
-    tim1.enable(embassy_stm32::timer::Channel::Ch1);
-    tim1.enable(embassy_stm32::timer::Channel::Ch2);
-    tim1.enable(embassy_stm32::timer::Channel::Ch3);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch1, tim1.get_max_duty() * 0);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch2, tim1.get_max_duty() * 0);
-    tim1.set_duty(embassy_stm32::timer::Channel::Ch3, tim1.get_max_duty() / 50);
+    let tim1_channels = tim1.split();
+    let mut led_a_ch = tim1_channels.ch1;
+    let mut led_b_ch = tim1_channels.ch2;
+    led_a_ch.enable();
+    led_b_ch.enable();
+    led_a_ch.set_duty_cycle_percent(0);
+    led_b_ch.set_duty_cycle_percent(0);
 
     // Fan
-
-    let mut fan_speed_pin = PwmInput::new(
-        unsafe { p.TIM2.clone_unchecked() },
-        p.PA15,
-        Pull::Up,
-        khz(1000),
-    );
     let fan_ctrl_pin = PwmPin::new_ch1(p.PB1, OutputType::PushPull);
 
     let tim14 = SimplePwm::new(
@@ -168,10 +164,26 @@ async fn main(spawner: Spawner) {
         embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp,
     );
     let tim14 = TIM14.init(tim14);
-    fan_speed_pin.enable();
+
+    // ADC
+
+    let mut adc = Adc::new(p.ADC1);
+    adc.set_sample_time(SampleTime::CYCLES79_5);
+    adc.set_resolution(Resolution::BITS12);
+    let dma = p.DMA1_CH1;
+    let vrefint_ch = adc.enable_vrefint().degrade_adc();
+    let vbus_ch = p.PA0.degrade_adc();
+    let vcc_ch = p.PB0.degrade_adc();
+    let temp_ch = adc.enable_temperature().degrade_adc();
+    let adc = ADC_INSTANCE.init(adc);
+
+    // Spawn tasks
 
     spawner.spawn(otp_task(temp_sensor, tim14)).unwrap();
     spawner.spawn(dp_sink_task(sink)).unwrap();
+    spawner
+        .spawn(adc_task(adc, dma, vrefint_ch, vbus_ch, vcc_ch, temp_ch))
+        .unwrap();
 
     // init buttons
 
@@ -211,26 +223,19 @@ async fn main(spawner: Spawner) {
             led_ww_level = (led_ww_level - LED_LEVEL_STEP).max(0.0);
         }
 
-        let tim1_max_duty = tim1.get_max_duty() as f64;
-        let final_led_cw_level = tim1_max_duty * led_cw_level * otp_luminance_ratio;
-        let final_led_ww_level = tim1_max_duty * led_ww_level * otp_luminance_ratio;
+        let final_led_cw_level = 100f64 * led_cw_level * otp_luminance_ratio;
+        let final_led_ww_level = 100f64 * led_ww_level * otp_luminance_ratio;
 
         if final_led_cw_level != prev_led_cw_level {
             prev_led_cw_level = final_led_cw_level;
 
-            tim1.set_duty(
-                embassy_stm32::timer::Channel::Ch1,
-                final_led_cw_level as u32,
-            );
+            led_a_ch.set_duty_cycle_percent(final_led_cw_level as u8);
         }
 
         if final_led_ww_level != prev_led_ww_level {
             prev_led_ww_level = final_led_ww_level;
 
-            tim1.set_duty(
-                embassy_stm32::timer::Channel::Ch2,
-                final_led_ww_level as u32,
-            );
+            led_b_ch.set_duty_cycle_percent(final_led_ww_level as u8);
         }
 
         ticker.next().await;
@@ -244,10 +249,10 @@ async fn otp_task(
     >,
     tim: &'static mut SimplePwm<'static, peripherals::TIM14>,
 ) {
-    let tim14_max_duty = tim.get_max_duty();
+    let mut pwm_ch = tim.ch1();
 
-    tim.set_duty(embassy_stm32::timer::Channel::Ch1, tim14_max_duty);
-    tim.enable(embassy_stm32::timer::Channel::Ch1);
+    pwm_ch.set_duty_cycle_fully_on();
+    pwm_ch.enable();
 
     let mut ticker = Ticker::every(Duration::from_millis(5000));
     let mut otp_luminance_ratio = 0f64;
@@ -284,10 +289,9 @@ async fn otp_task(
 
                 let otp_fan_ratio = (1.0 - otp_ratio) * 2.0 + FAN_MINIMUM_DUTY_CYCLE;
 
-                let fan_speed =
-                    ((tim14_max_duty as f64 * otp_fan_ratio) as u32).min(tim14_max_duty);
-                tim.set_duty(embassy_stm32::timer::Channel::Ch1, fan_speed);
-                tim.enable(embassy_stm32::timer::Channel::Ch1);
+                let fan_speed = ((otp_fan_ratio * 100.0) as u32).min(100);
+                pwm_ch.set_duty_cycle_percent(fan_speed as u8);
+                pwm_ch.enable();
                 defmt::info!(
                     "Temperature: {}\t Fan speed: {}\tLight level: {}",
                     temp,
@@ -301,7 +305,7 @@ async fn otp_task(
                     drop(otp_luminance_ratio_guard);
                     otp_luminance_ratio = 1.0;
                 }
-                tim.disable(embassy_stm32::timer::Channel::Ch1);
+                pwm_ch.disable();
             }
         }
     }
@@ -343,5 +347,58 @@ async fn dp_sink_task(
                 }
             }
         }
+    }
+}
+
+#[embassy_executor::task]
+async fn adc_task(
+    adc: &'static mut Adc<'static, ADC1>,
+    mut dma: DMA1_CH1,
+    mut vrefint_ch: AnyAdcChannel<ADC1>,
+    mut vbus_ch: AnyAdcChannel<ADC1>,
+    mut vcc_ch: AnyAdcChannel<ADC1>,
+    mut temp_ch: AnyAdcChannel<ADC1>,
+) {
+    let mut read_buffer = unsafe { &mut DMA_BUF[..] };
+
+    let ts_cal1 = unsafe { read_volatile(0x1FFF_75A8 as *const u16) } as u16;
+    let ts_cal2 = unsafe { read_volatile(0x1FFF_75CA as *const u16) } as u16;
+    let vrefint_cal = unsafe { read_volatile(0x1FFF_75AA as *const u16) } as u16;
+
+    let mut ticker = Ticker::every(Duration::from_millis(10_000));
+
+    loop {
+        ticker.next().await;
+
+        adc.read(
+            &mut dma,
+            [
+                (&mut vbus_ch, SampleTime::CYCLES160_5),
+                (&mut vrefint_ch, SampleTime::CYCLES160_5),
+                (&mut vcc_ch, SampleTime::CYCLES160_5),
+                (&mut temp_ch, SampleTime::CYCLES160_5),
+            ]
+            .into_iter(),
+            &mut read_buffer,
+        )
+        .await;
+
+        let vdda = 3.0 * vrefint_cal as f64 / read_buffer[3] as f64;
+
+        let vbus = vdda / 4095.0 * read_buffer[0] as f64 / ADC_DIVIDER;
+        let vcc = vdda / 4095.0 * read_buffer[1] as f64 / ADC_DIVIDER;
+
+        let temp_degrees = (130 - 30) as f64 / (ts_cal2 - ts_cal1) as f64
+            * (read_buffer[2] - ts_cal1) as f64
+            + 30.0;
+
+        defmt::info!(
+            "ADC: {},\t Temp: {}, Vdda: {}, \t Vbus: {}, \t Vcc: {}",
+            read_buffer,
+            temp_degrees,
+            vdda,
+            vbus,
+            vcc
+        );
     }
 }

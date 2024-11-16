@@ -54,7 +54,7 @@ portable-atomic = { version = "1.9", features = ["unsafe-assume-single-core"] }
 ryu = "1.0.18"
 static_cell = "2.1.0"
 
-gx21m15 = { features = ["async"], version = "0.1.0" }
+gx21m15 = { features = ["async"], version = "0.1.1" }
 husb238 = { version = "0.1.1", features = ["async", "defmt"] }
 sgm41511 = { path = "../sgm41511-rs", features = ["async", "defmt"] }
 
