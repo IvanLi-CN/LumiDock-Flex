@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::ptr::read_volatile;
+use core::{ptr::read_volatile, sync::atomic::AtomicBool};
 
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
@@ -19,12 +19,13 @@ use embassy_stm32::{
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
 
 use defmt_rtt as _;
-use embassy_time::{Duration, Ticker};
+use embassy_time::{Duration, Instant, Ticker};
 use husb238::{Command, Husb238};
 // global logger
 use panic_probe as _;
 
 use gx21m15::{Gx21m15, Gx21m15Config};
+use portable_atomic::AtomicU64;
 use sgm41511::{types::Reg06Values, SGM41511};
 use shared::{
     ADC_DIVIDER, FAN_MINIMUM_DUTY_CYCLE, LED_LEVEL_STEP, OTP_HYSTERESIS_TEMP, OTP_SHUTDOWN_TEMP,
@@ -50,6 +51,8 @@ static OTP_LUMINANCE_RATIO: Mutex<CriticalSectionRawMutex, f64> = Mutex::new(1.0
 
 static TEMPERATURE_SIGNAL: Signal<CriticalSectionRawMutex, f64> = Signal::new();
 static BUS_VOLTAGE_SIGNAL: Signal<CriticalSectionRawMutex, f64> = Signal::new();
+static POWER_GOOD: AtomicBool = AtomicBool::new(true);
+static POWER_DOWN_AT: AtomicU64 = AtomicU64::new(0);
 
 bind_interrupts!(struct Irqs {
     I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>, i2c::ErrorInterruptHandler<peripherals::I2C1>;
@@ -65,7 +68,7 @@ async fn main(spawner: Spawner) {
 
     defmt::println!("Hello, LumiDock Flex!");
 
-    let mut os_pin = ExtiInput::new(p.PA1, p.EXTI1, Pull::Up);
+    let os_pin = ExtiInput::new(p.PA1, p.EXTI1, Pull::Up);
 
     let i2c = I2c::new(
         p.I2C1,
@@ -204,6 +207,8 @@ async fn main(spawner: Spawner) {
     let mut prev_led_cw_level = 0f64;
     let mut prev_led_ww_level = 0f64;
 
+    let mut last_button_down = Instant::now();
+
     let mut ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
@@ -214,14 +219,18 @@ async fn main(spawner: Spawner) {
         // Buttons
 
         if btn_cw_up.is_low() && btn_cw_down.is_high() {
+            last_button_down = Instant::now();
             led_cw_level = (LED_LEVEL_STEP + led_cw_level).min(1.0);
         } else if btn_cw_up.is_high() && btn_cw_down.is_low() {
+            last_button_down = Instant::now();
             led_cw_level = (led_cw_level - LED_LEVEL_STEP).max(0.0);
         }
 
         if btn_ww_up.is_low() && btn_ww_down.is_high() {
+            last_button_down = Instant::now();
             led_ww_level = (LED_LEVEL_STEP + led_ww_level).min(1.0);
         } else if btn_ww_up.is_high() && btn_ww_down.is_low() {
+            last_button_down = Instant::now();
             led_ww_level = (led_ww_level - LED_LEVEL_STEP).max(0.0);
         }
 
@@ -238,6 +247,23 @@ async fn main(spawner: Spawner) {
             prev_led_ww_level = final_led_ww_level;
 
             led_b_ch.set_duty_cycle_percent(final_led_ww_level as u8);
+        }
+
+        if os_pin.is_low() {
+            defmt::error!("TOO HOT!");
+        }
+
+        if POWER_DOWN_AT.load(core::sync::atomic::Ordering::Relaxed) > last_button_down.as_ticks()
+            && !POWER_GOOD.load(core::sync::atomic::Ordering::Relaxed)
+            && (led_cw_level > 0.0 || led_ww_level > 0.0)
+        {
+            led_cw_level = (led_cw_level - 0.0003).max(0.0);
+            led_ww_level = (led_ww_level - 0.0003).max(0.0);
+            defmt::info!(
+                "Power down. LEDs: {}% / {}%",
+                100f64 * led_cw_level,
+                100f64 * led_ww_level
+            );
         }
 
         ticker.next().await;
@@ -356,6 +382,8 @@ async fn adc_task(
     let ts_cal2 = unsafe { read_volatile(0x1FFF_75CA as *const u16) } as u16;
     let vrefint_cal = unsafe { read_volatile(0x1FFF_75AA as *const u16) } as u16;
 
+    let mut last_power_up_at = Instant::from_ticks(POWER_DOWN_AT.load(core::sync::atomic::Ordering::Relaxed));
+
     let mut ticker = Ticker::every(Duration::from_millis(10_000));
 
     loop {
@@ -386,6 +414,19 @@ async fn adc_task(
 
         TEMPERATURE_SIGNAL.signal(temp_degrees);
         BUS_VOLTAGE_SIGNAL.signal(vbus);
+
+        let now = Instant::now();
+        if last_power_up_at.as_ticks() <= POWER_DOWN_AT.load(core::sync::atomic::Ordering::Relaxed) {
+            if vbus > 4.0 {
+                last_power_up_at = now
+            }
+        } else if vbus < 4.0 {
+            POWER_GOOD.store(vbus > 4.0, core::sync::atomic::Ordering::Relaxed);
+            POWER_DOWN_AT.store(
+                Instant::now().as_ticks(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         defmt::info!(
             "ADC: {},\t Temp: {}, Vdda: {}, \t Vbus: {}, \t Vcc: {}",
