@@ -16,9 +16,7 @@ use embassy_stm32::{
     time::{khz, Hertz},
     timer::simple_pwm::{PwmPin, SimplePwm},
 };
-use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
-};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
 
 use defmt_rtt as _;
 use embassy_time::{Duration, Ticker};
@@ -247,9 +245,7 @@ async fn main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn otp_task(
-    tim: &'static mut SimplePwm<'static, peripherals::TIM14>,
-) {
+async fn otp_task(tim: &'static mut SimplePwm<'static, peripherals::TIM14>) {
     let mut pwm_ch = tim.ch1();
 
     pwm_ch.set_duty_cycle_fully_on();
@@ -383,8 +379,9 @@ async fn adc_task(
         let vbus = vdda / 4095.0 * read_buffer[0] as f64 / ADC_DIVIDER;
         let vcc = vdda / 4095.0 * read_buffer[1] as f64 / ADC_DIVIDER;
 
+        let raw_temp = read_buffer[2];
         let temp_degrees = (130 - 30) as f64 / (ts_cal2 - ts_cal1) as f64
-            * (read_buffer[2] - ts_cal1) as f64
+            * (raw_temp as f64 - ts_cal1 as f64)
             + 30.0;
 
         TEMPERATURE_SIGNAL.signal(temp_degrees);
