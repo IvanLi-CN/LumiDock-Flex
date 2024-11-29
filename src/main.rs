@@ -50,7 +50,7 @@ static ADC_INSTANCE: StaticCell<Adc<'static, ADC1>> = StaticCell::new();
 static OTP_LUMINANCE_RATIO: Mutex<CriticalSectionRawMutex, f64> = Mutex::new(1.0); // 1.0 = 100%
 
 static TEMPERATURE_SIGNAL: Signal<CriticalSectionRawMutex, f64> = Signal::new();
-static BUS_VOLTAGE_SIGNAL: Signal<CriticalSectionRawMutex, f64> = Signal::new();
+static HIGH_VBUS_VOLTAGE: AtomicBool = AtomicBool::new(false);
 static POWER_GOOD: AtomicBool = AtomicBool::new(true);
 static POWER_DOWN_AT: AtomicU64 = AtomicU64::new(0);
 
@@ -234,8 +234,17 @@ async fn main(spawner: Spawner) {
             led_ww_level = (led_ww_level - LED_LEVEL_STEP).max(0.0);
         }
 
-        let final_led_cw_level = 100f64 * led_cw_level * otp_luminance_ratio;
-        let final_led_ww_level = 100f64 * led_ww_level * otp_luminance_ratio;
+        let mut final_led_cw_level = 100f64 * led_cw_level * otp_luminance_ratio;
+        let mut final_led_ww_level = 100f64 * led_ww_level * otp_luminance_ratio;
+
+        // When the high voltage input above 5V is not available,
+        // the maximum brightness and other possible power consumption will require 20W/5V=4A of current.
+        // To avoid high current causing USB power protection, the brightness is limited here to not exceed 30%.
+
+        if !HIGH_VBUS_VOLTAGE.load(core::sync::atomic::Ordering::Relaxed) {
+            final_led_cw_level = final_led_cw_level.clamp(0.0, 50.0);
+            final_led_ww_level = final_led_ww_level.clamp(0.0, 50.0);
+        }
 
         if final_led_cw_level != prev_led_cw_level {
             prev_led_cw_level = final_led_cw_level;
@@ -334,7 +343,7 @@ async fn dp_sink_task(
         &'static mut I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, Async>>,
     >,
 ) {
-    let mut ticker = Ticker::every(Duration::from_millis(10_000));
+    let mut ticker = Ticker::every(Duration::from_millis(2_000));
 
     loop {
         ticker.next().await;
@@ -362,6 +371,13 @@ async fn dp_sink_task(
                         defmt::warn!("not support 9v or 12v");
                     }
                 }
+            } else {
+                // sleep more
+
+                ticker.next().await;
+                ticker.next().await;
+                ticker.next().await;
+                ticker.next().await;
             }
         }
     }
@@ -382,9 +398,10 @@ async fn adc_task(
     let ts_cal2 = unsafe { read_volatile(0x1FFF_75CA as *const u16) } as u16;
     let vrefint_cal = unsafe { read_volatile(0x1FFF_75AA as *const u16) } as u16;
 
-    let mut last_power_up_at = Instant::from_ticks(POWER_DOWN_AT.load(core::sync::atomic::Ordering::Relaxed));
+    let mut last_power_up_at =
+        Instant::from_ticks(POWER_DOWN_AT.load(core::sync::atomic::Ordering::Relaxed));
 
-    let mut ticker = Ticker::every(Duration::from_millis(10_000));
+    let mut ticker = Ticker::every(Duration::from_millis(5_000));
 
     loop {
         ticker.next().await;
@@ -413,10 +430,11 @@ async fn adc_task(
             + 30.0;
 
         TEMPERATURE_SIGNAL.signal(temp_degrees);
-        BUS_VOLTAGE_SIGNAL.signal(vbus);
+        HIGH_VBUS_VOLTAGE.store(vbus > 8.0, core::sync::atomic::Ordering::Relaxed);
 
         let now = Instant::now();
-        if last_power_up_at.as_ticks() <= POWER_DOWN_AT.load(core::sync::atomic::Ordering::Relaxed) {
+        if last_power_up_at.as_ticks() <= POWER_DOWN_AT.load(core::sync::atomic::Ordering::Relaxed)
+        {
             if vbus > 4.0 {
                 last_power_up_at = now
             }
